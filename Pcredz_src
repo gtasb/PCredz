@@ -49,11 +49,11 @@ REGEX_HTTP_BASIC = re.compile(rb'Authorization: Basic ([A-Za-z0-9+/=]+)', re.IGN
 REGEX_NTLM_CHALLENGE = re.compile(rb'(?:WWW|Proxy)-Authenticate: NTLM ([A-Za-z0-9+/=]+)', re.IGNORECASE)
 REGEX_NTLM_AUTH = re.compile(rb'(?:Authorization|Proxy-Authorization): NTLM ([A-Za-z0-9+/=]+)', re.IGNORECASE)
 REGEX_PASSWORD_FIELDS = re.compile(
-    r'(?:^|&)([^&=]*?(?:password|pass|_password|passwd|session_password|sessionpassword|'
+    r'(?:^|&)(password|pass|_password|passwd|session_password|sessionpassword|'
     r'login_password|loginpassword|form_pw|pw|userpassword|pwd|upassword|'
     r'passwort|passwrd|wppassword|j_password|admin_password|admin_pass|'
-    r'secret|api_key|token|key|auth)[^&=]*?)\s*=\s*([^&"\s]+)',
-    re.IGNORECASE | re.MULTILINE
+    r'secret|api_key|token|key|auth)\s*=\s*([^&"\s]+)',
+    re.IGNORECASE
 )
 
 def write_data(outfile, data, key):
@@ -215,12 +215,12 @@ def extract_http_basic(payload, src, sport, dst, dport):
         except (base64.binascii.Error, UnicodeDecodeError):
             pass
 
-def extract_http_password_fields(payload, src, sport, dst, dport, enable_https, enable_http_response=False):
-    """Extract password-like fields from HTTP requests and optionally responses"""
+def extract_http_password_fields(payload, src, sport, dst, dport):
+    """Extract password-like fields from HTTP requests"""
     if is_protocol_disabled('HTTP'):
         return
         
-    if not enable_https and (dport in {443, 8443} or sport in {443, 8443}):
+    if dport in {443, 8443} or sport in {443, 8443}:
         return
         
     try:
@@ -228,112 +228,29 @@ def extract_http_password_fields(payload, src, sport, dst, dport, enable_https, 
     except (UnicodeDecodeError, AttributeError):
         return
     
-    # Extract Host from HTTP request header
-    # Normalize line endings: replace \r\n with \n, then split
-    payload_normalized = payload_str.replace('\r\n', '\n').replace('\r', '\n')
-    lines = payload_normalized.split('\n')
-    
-    # Check if this is an HTTP request or response
-    # HTTP requests start with methods like GET, POST, PUT, etc.
-    # HTTP responses start with "HTTP/"
-    if not lines or not lines[0]:
-        return
-    first_line = lines[0].strip().upper()
-    http_methods = ['GET', 'POST', 'PUT', 'DELETE', 'HEAD', 'OPTIONS', 'PATCH', 'TRACE', 'CONNECT']
-    is_http_request = any(first_line.startswith(method + ' ') for method in http_methods)
-    is_http_response = first_line.startswith('HTTP/')
-    
-    # Skip if not HTTP request/response, or skip response if not enabled
-    if not is_http_request and not is_http_response:
-        return
-    if is_http_response and not enable_http_response:
-        return
-    
-    host = None
-    # Search for Host header in all lines (usually in the second line, but can be anywhere)
-    # Note: HTTP responses typically don't have Host header, so host will be None for responses
-    for line in lines:
-        line_stripped = line.strip()
-        # Match "Host:" at the start of the line (case-insensitive)
-        if line_stripped.lower().startswith('host:'):
-            # Extract host value, handling formats like "Host: example.com" or "Host: example.com:8080"
-            # Keep the full host value including port if present
-            # Split on "Host:" (case-insensitive) to get the value part
-            parts = line_stripped.split(':', 1)
-            if len(parts) == 2:
-                host = parts[1].strip()
-                break
-    
-    # For HTTP responses without Host header, we could use IP:port as fallback
-    # But for now, we'll leave it as None to distinguish from requests
-    
-    # Use normalized payload for regex matching to ensure consistency
-    # This will match password fields in URL query strings, POST body, and HTTP headers (Cookie, Authorization, etc.)
-    for match in REGEX_PASSWORD_FIELDS.finditer(payload_normalized):
+    for match in REGEX_PASSWORD_FIELDS.finditer(payload_str):
         value = match.group(2)
         if len(value) > 3 and value.isprintable() and not value.isspace():
-            # Extract ONLY the line containing the match - never show other lines
-            match_start = match.start()
-            match_text = match.group(0)  # The full matched text (e.g., "&token=value")
+            # Extract the full line for context
+            lines = payload_str.split('\n')
+            matched_line = None
+            for line in lines:
+                if match.group(0) in line:
+                    matched_line = line.strip()
+                    break
             
-            # Find which line contains the match by counting newlines before match position
-            line_num = payload_normalized[:match_start].count('\n')
-            
-            # Get ONLY the line containing the match - ensure it's a single line
-            if line_num < len(lines):
-                matched_line = lines[line_num].strip()
-                
-                # Verify that the match is actually in this line
-                # If match_text is not found in the line, something is wrong - skip it
-                if match_text not in matched_line and match.group(0) not in matched_line:
-                    # Match not found in the line - this shouldn't happen, skip this match
-                    continue
-                
-                # Remove any remaining newlines/carriage returns to ensure single line
-                matched_line = matched_line.replace('\n', ' ').replace('\r', ' ').replace('\t', ' ')
-                # Collapse multiple spaces to single space
-                import re as re_module
-                matched_line = re_module.sub(r' +', ' ', matched_line).strip()
-                
-                # If line is too long, truncate it but keep it as a single line
-                # Show match + limited context (max 200 chars total for readability)
-                if len(matched_line) > 200:
-                    # Find match position within the line
-                    match_pos_in_line = matched_line.find(match_text)
-                    if match_pos_in_line >= 0:
-                        # Show 60 chars before match, match, and 60 chars after (max ~200 chars)
-                        start = max(0, match_pos_in_line - 60)
-                        end = min(len(matched_line), match_pos_in_line + len(match_text) + 60)
-                        matched_line = matched_line[start:end]
-                        if start > 0:
-                            matched_line = '...' + matched_line
-                        if end < len(matched_line):
-                            matched_line = matched_line + '...'
-                    else:
-                        # Match text not found in line (shouldn't happen), truncate from start
-                        matched_line = matched_line[:200] + '...'
-            else:
-                # Match not in any line (shouldn't happen), just show match itself
-                matched_line = match_text
-            
-            # Determine if this is a request or response for message formatting
-            msg_type = 'Response' if is_http_response else 'Request'
-            
-            # matched_line is already truncated to max 200 chars above
-            if matched_line:
-                if host:
-                    msg = f'Host: {host}\nPotential password submission:\n{msg_type}: {matched_line}'
-                else:
-                    msg = f'Potential password submission:\n{msg_type}: {matched_line}'
+            if matched_line and len(matched_line) < 500:
+                msg = f'Potential password submission:\nRequest: {matched_line}'
                 display_line = matched_line
             else:
-                # Fallback: show just the match itself
-                match_text = match.group(0)
-                if host:
-                    msg = f'Host: {host}\nPotential password submission:\n{msg_type}: {match_text}'
-                else:
-                    msg = f'Potential password submission:\n{msg_type}: {match_text}'
-                display_line = match_text
+                # Fallback: show context
+                match_start = match.start()
+                match_end = match.end()
+                context_start = max(0, match_start - 100)
+                context_end = min(len(payload_str), match_end + 100)
+                context = payload_str[context_start:context_end]
+                msg = f'Potential password submission:\nRequest: ...{context}...'
+                display_line = context
             
             # Use field name and value as credential key for deduplication
             field_name = match.group(1)
@@ -695,7 +612,7 @@ def process_packet(packet):
         extract_ntlm(search_payload, src, sport, dst, dport)
         extract_ntlm_from_http(payload, src, sport, dst, dport)
         extract_http_basic(payload, src, sport, dst, dport)
-        extract_http_password_fields(payload, src, sport, dst, dport, args.enable_https, args.enable_http_response)
+        extract_http_password_fields(payload, src, sport, dst, dport)
         extract_smtp_auth(payload, src, sport, dst, dport)
         extract_ldap_simple_bind(payload, src, sport, dst, dport)
         
@@ -776,8 +693,6 @@ if __name__ == '__main__':
                         help='Disable protocol (can be used multiple times). Options: NTLM, HTTP, FTP, IRC, LDAP, SMTP, Kerberos, SNMP, MSSQL')
     parser.add_argument('--exclude-host', dest='exclude_hosts', action='append',
                         help='Exclude host IP from capture (can be used multiple times)')
-    parser.add_argument('--enable-https', action='store_true', dest='enable_https', default=False, help='Enable HTTPS decryption')
-    parser.add_argument('--enable-http-response', action='store_true', dest='enable_http_response', default=False, help='Enable HTTP response scan')
     args = parser.parse_args()
     
     # Process disabled protocols
