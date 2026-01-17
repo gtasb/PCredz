@@ -16,6 +16,40 @@
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 # GNU General Public License for more details.
 
+import sys
+import os
+
+# ANSI color codes for terminal output (defined early for use in error messages)
+class Colors:
+    """ANSI color codes - simplified color scheme"""
+    RESET = '\033[0m'
+    CYAN = '\033[96m'    
+    GREEN = '\033[1;92m'  # For labels (Host:, Request:, etc.)
+    RED = '\033[91m'     # For sensitive data (passwords, tokens)
+    YELLOW_BOLD = '\033[1;33m'  # For packet header (IP addresses and ports)
+
+def supports_color():
+    """Check if terminal supports color output"""
+    # Check if output is redirected
+    if not sys.stdout.isatty():
+        return False
+    # Check platform
+    if sys.platform == 'win32':
+        # Windows 10+ supports ANSI colors
+        return True
+    # Unix-like systems typically support colors
+    return 'TERM' in os.environ and os.environ['TERM'] != 'dumb'
+
+# Enable/disable colors based on terminal support
+USE_COLORS = supports_color()
+
+def colorize(text, color):
+    """Apply color to text if colors are enabled"""
+    if USE_COLORS:
+        return f'{color}{text}{Colors.RESET}'
+    return text
+
+# Now import other modules
 try:
     import pcapy
 except ImportError:
@@ -25,7 +59,6 @@ except ImportError:
 
 import datetime
 import argparse
-import os
 import re
 import time
 import logging
@@ -56,6 +89,51 @@ REGEX_PASSWORD_FIELDS = re.compile(
     re.IGNORECASE | re.MULTILINE
 )
 
+# Additional regex patterns for enhanced credential detection
+# Access key patterns (access_key_id, access-key-secret, LTAI*)
+REGEX_ACCESS_KEY = re.compile(
+    r'((?:access)[\-_]?(?:key)[\-_]?(?:id|secret)|LTAI[a-z0-9]{12,20})',
+    re.IGNORECASE
+)
+
+# JavaScript password patterns
+REGEX_JS_PASSWORD = re.compile(
+    r'(?:[\'"])(?:[\.\w]{0,32})?[p](?:ass|wd|asswd|assword)(?:[\.\w]{0,32})?(?:[\'"])\s*(?:[:=]{1,3}|![=]{1,2}|\)?\.val\()\s*(?:[\'"])([^\'"]+?)(?:[\'"])(?:[,\)])?|'
+    r'(?:[\'"])([^\'"]+?)(?:[\'"])\s*(?:[:=]{1,3}|![=]{1,2})\s*(?:[\.\w]{0,32})?[p](?:ass|wd|asswd|assword)(?:[\.\w]{0,32})?(?:[\'"])',
+    re.IGNORECASE | re.MULTILINE
+)
+
+# Corp ID/Secret patterns
+REGEX_CORP_CRED = re.compile(
+    r'corp(?:id|secret)\s*[:=]\s*([^\s&"\'<>]+)',
+    re.IGNORECASE
+)
+
+# JDBC connection strings
+REGEX_JDBC = re.compile(
+    r'jdbc:[a-z:]+://[a-z0-9\.\-_:;=/@?,&]+',
+    re.IGNORECASE
+)
+
+# Basic/Bearer token patterns
+REGEX_AUTH_TOKEN = re.compile(
+    r'(?:basic|bearer)\s+([a-z0-9=:_\+\-\./]{5,100})',
+    re.IGNORECASE
+)
+
+# JavaScript key/secret/token patterns
+REGEX_JS_KEY_SECRET = re.compile(
+    r'(?:[\'"])(?:[\.\w]{0,32})?(?:key|secret|token|config|auth|access|admin|ticket)(?:[\.\w]{0,32})?(?:[\'"])\s*(?:[:=]{1,3}|![=]{1,2}|\)?\.val\()\s*(?:[\'"])([^\'"]+?)(?:[\'"])(?:[,\)])?|'
+    r'(?:[\'"])([^\'"]+?)(?:[\'"])\s*(?:[:=]{1,3}|![=]{1,2})\s*(?:[\.\w]{0,32})?(?:key|secret|token|config|auth|access|admin|ticket)(?:[\.\w]{0,32})?(?:[\'"])',
+    re.IGNORECASE | re.MULTILINE
+)
+
+# XML Key tags
+REGEX_XML_KEY = re.compile(
+    r'<Key>(.*?)</Key>',
+    re.IGNORECASE | re.DOTALL
+)
+
 def write_data(outfile, data, key):
     """Write credentials to file with deduplication"""
     outfile_path = os.path.join(output_path, "logs", outfile)
@@ -70,9 +148,91 @@ def write_data(outfile, data, key):
         f.write(data + '\n')
 
 def get_packet_info(src, sport, dst, dport):
-    """Generate packet info string with optional timestamp"""
+    """Generate packet info string with optional timestamp and colors"""
     ts = f'[{datetime.datetime.fromtimestamp(time.time())}] ' if args.timestamp else ''
-    return f'{ts}{src}:{sport} > {dst}:{dport}'
+    # Colorize IP addresses and ports with yellow bold
+    header = f'{src}:{sport} > {dst}:{dport}'
+    return f'{ts}{colorize(header, Colors.YELLOW_BOLD)}'
+
+def colorize_message(message):
+    """Add colors to message - labels in green, matched patterns from regex rules in red"""
+    lines = message.split('\n')
+    colored_lines = []
+    
+    # List of all regex patterns to use for highlighting
+    regex_patterns = [
+        REGEX_PASSWORD_FIELDS,
+        REGEX_ACCESS_KEY,
+        REGEX_CORP_CRED,
+        REGEX_JDBC,
+        REGEX_AUTH_TOKEN,
+        REGEX_JS_PASSWORD,
+        REGEX_JS_KEY_SECRET,
+        REGEX_XML_KEY
+    ]
+    
+    for line in lines:
+        if not line.strip():
+            colored_lines.append(line)
+            continue
+        
+        # Colorize labels
+        if line.startswith('Host:'):
+            parts = line.split(':', 1)
+            if len(parts) == 2:
+                label = colorize('Host:', Colors.GREEN)
+                content = parts[1].strip()
+                # Highlight matched patterns in content using existing regex rules
+                colored_content = highlight_matches(content, regex_patterns)
+                colored_lines.append(f'{label} {colored_content}')
+            else:
+                colored_lines.append(line)
+        
+        elif 'Potential password submission:' in line:
+            label = colorize('Potential password submission:', Colors.GREEN)
+            colored_lines.append(label)
+        
+        elif line.startswith('Request:') or line.startswith('Response:'):
+            parts = line.split(':', 1)
+            if len(parts) == 2:
+                label = colorize(parts[0] + ':', Colors.GREEN)
+                content = parts[1].strip()
+                # Highlight matched patterns in content using existing regex rules
+                colored_content = highlight_matches(content, regex_patterns)
+                colored_lines.append(f'{label} {colored_content}')
+            else:
+                colored_lines.append(line)
+        
+        else:
+            # Highlight matched patterns in other lines
+            colored_line = highlight_matches(line, regex_patterns)
+            colored_lines.append(colored_line)
+    
+    return '\n'.join(colored_lines)
+
+def highlight_matches(text, patterns):
+    """Highlight all matches from regex patterns in text with red color"""
+    if not text:
+        return text
+    
+    # Collect all matches with their positions
+    matches = []
+    for pattern in patterns:
+        for match in pattern.finditer(text):
+            matches.append((match.start(), match.end(), match.group(0)))
+    
+    # Sort by position (reverse order for easier replacement)
+    matches.sort(key=lambda x: x[0], reverse=True)
+    
+    # Apply colorization from end to start to preserve positions
+    colored_text = text
+    for start, end, matched_text in matches:
+        if start < len(colored_text) and end <= len(colored_text):
+            # Check if this part hasn't been colored yet
+            if matched_text in colored_text[start:end]:
+                colored_text = colored_text[:start] + colorize(matched_text, Colors.RED) + colored_text[end:]
+    
+    return colored_text
 
 def print_and_log(src, sport, dst, dport, message, credential_key=None):
     """Print and log message with deduplication (unless verbose)
@@ -82,10 +242,13 @@ def print_and_log(src, sport, dst, dport, message, credential_key=None):
                        If None, always prints
     """
     head = get_packet_info(src, sport, dst, dport)
-    full_msg = f'{head}\n{message}\n'
+    # Colorize message for console output
+    colored_message = colorize_message(message)
+    full_msg = f'{head}\n{colored_message}\n'
     
-    # Always log to file
-    logger.warning(full_msg.rstrip('\n'))
+    # Always log to file (without colors)
+    plain_msg = f'{head}\n{message}\n'
+    logger.warning(plain_msg.rstrip('\n'))
     
     # Print to console: always if verbose, once per credential if not verbose
     if args.verbose:
@@ -267,6 +430,57 @@ def extract_http_password_fields(payload, src, sport, dst, dport, enable_https, 
     # For HTTP responses without Host header, we could use IP:port as fallback
     # But for now, we'll leave it as None to distinguish from requests
     
+    def extract_and_display_match(match, field_name, payload_normalized, lines, host, is_http_response):
+        """Helper function to extract and display a matched credential"""
+        value = None
+        match_text = None
+        
+        # Extract value based on match groups
+        if match.lastindex >= 1:
+            # Try to get the value from the last group (usually the credential value)
+            for i in range(match.lastindex, 0, -1):
+                if match.group(i) and len(match.group(i)) > 3:
+                    value = match.group(i)
+                    match_text = match.group(0)
+                    break
+        
+        # If no value found, use the full match
+        if not value:
+            value = match.group(0)
+            match_text = match.group(0)
+        
+        # Validate value
+        if len(value) < 3 or not value.isprintable() or value.isspace():
+            return
+        
+        # Extract the line containing the match
+        match_start = match.start()
+        line_num = payload_normalized[:match_start].count('\n')
+        
+        if line_num < len(lines):
+            matched_line = lines[line_num].strip()
+            
+            # Verify match is in the line
+            if match_text not in matched_line and match.group(0) not in matched_line:
+                return
+            
+            # Clean up the line
+            matched_line = matched_line.replace('\n', ' ').replace('\r', ' ').replace('\t', ' ')
+            matched_line = re.sub(r' +', ' ', matched_line).strip()
+        else:
+            matched_line = match_text
+        
+        # Format message
+        msg_type = 'Response' if is_http_response else 'Request'
+        if host:
+            msg = f'Host: {host}\nPotential password submission:\n{msg_type}: {matched_line}'
+        else:
+            msg = f'Potential password submission:\n{msg_type}: {matched_line}'
+        
+        # Log and display
+        print_and_log(src, sport, dst, dport, msg, credential_key=f'HTTP-Field:{field_name}={value}')
+        write_data('HTTP-PasswordFields.txt', matched_line, value)
+    
     # Use normalized payload for regex matching to ensure consistency
     # This will match password fields in URL query strings, POST body, and HTTP headers (Cookie, Authorization, etc.)
     for match in REGEX_PASSWORD_FIELDS.finditer(payload_normalized):
@@ -294,24 +508,7 @@ def extract_http_password_fields(payload, src, sport, dst, dport, enable_https, 
                 # Collapse multiple spaces to single space
                 import re as re_module
                 matched_line = re_module.sub(r' +', ' ', matched_line).strip()
-                
-                # If line is too long, truncate it but keep it as a single line
-                # Show match + limited context (max 200 chars total for readability)
-                if len(matched_line) > 200:
-                    # Find match position within the line
-                    match_pos_in_line = matched_line.find(match_text)
-                    if match_pos_in_line >= 0:
-                        # Show 60 chars before match, match, and 60 chars after (max ~200 chars)
-                        start = max(0, match_pos_in_line - 60)
-                        end = min(len(matched_line), match_pos_in_line + len(match_text) + 60)
-                        matched_line = matched_line[start:end]
-                        if start > 0:
-                            matched_line = '...' + matched_line
-                        if end < len(matched_line):
-                            matched_line = matched_line + '...'
-                    else:
-                        # Match text not found in line (shouldn't happen), truncate from start
-                        matched_line = matched_line[:200] + '...'
+
             else:
                 # Match not in any line (shouldn't happen), just show match itself
                 matched_line = match_text
@@ -319,7 +516,6 @@ def extract_http_password_fields(payload, src, sport, dst, dport, enable_https, 
             # Determine if this is a request or response for message formatting
             msg_type = 'Response' if is_http_response else 'Request'
             
-            # matched_line is already truncated to max 200 chars above
             if matched_line:
                 if host:
                     msg = f'Host: {host}\nPotential password submission:\n{msg_type}: {matched_line}'
@@ -339,6 +535,42 @@ def extract_http_password_fields(payload, src, sport, dst, dport, enable_https, 
             field_name = match.group(1)
             print_and_log(src, sport, dst, dport, msg, credential_key=f'HTTP-Field:{field_name}={value}')
             write_data('HTTP-PasswordFields.txt', display_line, value)
+    
+    # Additional regex patterns for enhanced credential detection
+    # Access key patterns (access_key_id, access-key-secret, LTAI*)
+    for match in REGEX_ACCESS_KEY.finditer(payload_normalized):
+        extract_and_display_match(match, 'access_key', payload_normalized, lines, host, is_http_response)
+    
+    # Corp ID/Secret patterns
+    for match in REGEX_CORP_CRED.finditer(payload_normalized):
+        extract_and_display_match(match, 'corp_cred', payload_normalized, lines, host, is_http_response)
+    
+    # JDBC connection strings
+    for match in REGEX_JDBC.finditer(payload_normalized):
+        extract_and_display_match(match, 'jdbc', payload_normalized, lines, host, is_http_response)
+    
+    # Basic/Bearer token patterns (excluding Authorization header which is already handled)
+    for match in REGEX_AUTH_TOKEN.finditer(payload_normalized):
+        # Skip if it's in Authorization header (already handled by REGEX_HTTP_BASIC)
+        match_start = match.start()
+        line_num = payload_normalized[:match_start].count('\n')
+        if line_num < len(lines):
+            line_lower = lines[line_num].lower()
+            if 'authorization:' in line_lower:
+                continue
+        extract_and_display_match(match, 'auth_token', payload_normalized, lines, host, is_http_response)
+    
+    # JavaScript password patterns
+    for match in REGEX_JS_PASSWORD.finditer(payload_normalized):
+        extract_and_display_match(match, 'js_password', payload_normalized, lines, host, is_http_response)
+    
+    # JavaScript key/secret/token patterns
+    for match in REGEX_JS_KEY_SECRET.finditer(payload_normalized):
+        extract_and_display_match(match, 'js_key_secret', payload_normalized, lines, host, is_http_response)
+    
+    # XML Key tags
+    for match in REGEX_XML_KEY.finditer(payload_normalized):
+        extract_and_display_match(match, 'xml_key', payload_normalized, lines, host, is_http_response)
 
 def extract_smtp_auth(payload, src, sport, dst, dport):
     """Extract SMTP authentication"""
@@ -740,13 +972,14 @@ def process_pcap(fname):
 
 def run():
     """Main execution"""
-    print(f'{VERSION}\nAuthor: Laurent Gaffie\nContact: lgaffie@secorizon.com\nX: @secorizon\n')
+    # print(f'{VERSION}\nAuthor: Laurent Gaffie\nContact: lgaffie@secorizon.com\nX: @secorizon\n')
+    print(f'{VERSION}\n')
     
     if args.activate_cc:
         print("CC number scanning activated\n")
     else:
         print("CC number scanning deactivated\n")
-
+    
     if args.interface:
         print(f'Live capture on {args.interface}\n')
         reader = pcapy.open_live(args.interface, 65536, True, 100)
@@ -783,12 +1016,14 @@ if __name__ == '__main__':
     # Process disabled protocols
     if args.disable_protocols:
         disabled_protocols.update(p.upper() for p in args.disable_protocols)
-        print(f"Disabled protocols: {', '.join(sorted(disabled_protocols))}\n")
+        protocols_str = ', '.join(sorted(disabled_protocols))
+        print(f"Disabled protocols: {protocols_str}\n")
     
     # Process excluded hosts
     if args.exclude_hosts:
         excluded_hosts.update(args.exclude_hosts)
-        print(f"Excluded hosts: {', '.join(sorted(excluded_hosts))}\n")
+        hosts_str = ', '.join(sorted(excluded_hosts))
+        print(f"Excluded hosts: {hosts_str}\n")
 
     output_path = args.output_path.rstrip('/')
     os.makedirs(os.path.join(output_path, 'logs'), exist_ok=True)
