@@ -65,6 +65,7 @@ import logging
 import base64
 import struct
 import binascii
+import signal
 
 VERSION = 'PCredz 2.1.0'
 
@@ -401,16 +402,27 @@ def extract_http_password_fields(payload, src, sport, dst, dport, enable_https, 
     # HTTP responses start with "HTTP/"
     if not lines or not lines[0]:
         return
-    first_line = lines[0].strip().upper()
+    first_line = lines[0].strip()
+    first_line_upper = first_line.upper()
     http_methods = ['GET', 'POST', 'PUT', 'DELETE', 'HEAD', 'OPTIONS', 'PATCH', 'TRACE', 'CONNECT']
-    is_http_request = any(first_line.startswith(method + ' ') for method in http_methods)
-    is_http_response = first_line.startswith('HTTP/')
+    is_http_request = any(first_line_upper.startswith(method + ' ') for method in http_methods)
+    is_http_response = first_line_upper.startswith('HTTP/')
     
     # Skip if not HTTP request/response, or skip response if not enabled
     if not is_http_request and not is_http_response:
         return
     if is_http_response and not enable_http_response:
         return
+    
+    # Extract HTTP method and path from request line
+    http_method = None
+    http_path = None
+    if is_http_request:
+        # Parse request line: "METHOD /path HTTP/1.1"
+        parts = first_line.split(' ', 2)
+        if len(parts) >= 2:
+            http_method = parts[0]
+            http_path = parts[1]
     
     host = None
     # Search for Host header in all lines (usually in the second line, but can be anywhere)
@@ -430,7 +442,7 @@ def extract_http_password_fields(payload, src, sport, dst, dport, enable_https, 
     # For HTTP responses without Host header, we could use IP:port as fallback
     # But for now, we'll leave it as None to distinguish from requests
     
-    def extract_and_display_match(match, field_name, payload_normalized, lines, host, is_http_response):
+    def extract_and_display_match(match, field_name, payload_normalized, lines, host, is_http_response, http_method=None, http_path=None):
         """Helper function to extract and display a matched credential"""
         value = None
         match_text = None
@@ -470,16 +482,22 @@ def extract_http_password_fields(payload, src, sport, dst, dport, enable_https, 
         else:
             matched_line = match_text
         
-        # Format message
+        # Format message with HTTP method and path
         msg_type = 'Response' if is_http_response else 'Request'
+        method_path_info = ''
+        if http_method and http_path:
+            method_path_info = f'{http_method} {http_path}\n'
+        
         if host:
-            msg = f'Host: {host}\nPotential password submission:\n{msg_type}: {matched_line}'
+            msg = f'{method_path_info}Host: {host}\nPotential password submission:\n{msg_type}: {matched_line}'
         else:
-            msg = f'Potential password submission:\n{msg_type}: {matched_line}'
+            msg = f'{method_path_info}Potential password submission:\n{msg_type}: {matched_line}'
         
         # Log and display
         print_and_log(src, sport, dst, dport, msg, credential_key=f'HTTP-Field:{field_name}={value}')
         write_data('HTTP-PasswordFields.txt', matched_line, value)
+        # Write full HTTP packet to HTTP-Raw.txt
+        write_data('HTTP-Raw.txt', payload_normalized, f'{field_name}={value}')
     
     # Use normalized payload for regex matching to ensure consistency
     # This will match password fields in URL query strings, POST body, and HTTP headers (Cookie, Authorization, etc.)
@@ -516,38 +534,46 @@ def extract_http_password_fields(payload, src, sport, dst, dport, enable_https, 
             # Determine if this is a request or response for message formatting
             msg_type = 'Response' if is_http_response else 'Request'
             
+            # Format message with HTTP method and path
+            method_path_info = ''
+            if http_method and http_path:
+                method_path_info = f'{http_method} {http_path}\n'
+            
             if matched_line:
                 if host:
-                    msg = f'Host: {host}\nPotential password submission:\n{msg_type}: {matched_line}'
+                    msg = f'{method_path_info}Host: {host}\nPotential password submission:\n{msg_type}: {matched_line}'
                 else:
-                    msg = f'Potential password submission:\n{msg_type}: {matched_line}'
+                    msg = f'{method_path_info}Potential password submission:\n{msg_type}: {matched_line}'
                 display_line = matched_line
             else:
                 # Fallback: show just the match itself
                 match_text = match.group(0)
                 if host:
-                    msg = f'Host: {host}\nPotential password submission:\n{msg_type}: {match_text}'
+                    msg = f'{method_path_info}Host: {host}\nPotential password submission:\n{msg_type}: {match_text}'
                 else:
-                    msg = f'Potential password submission:\n{msg_type}: {match_text}'
+                    msg = f'{method_path_info}Potential password submission:\n{msg_type}: {match_text}'
                 display_line = match_text
             
             # Use field name and value as credential key for deduplication
             field_name = match.group(1)
+            
             print_and_log(src, sport, dst, dport, msg, credential_key=f'HTTP-Field:{field_name}={value}')
             write_data('HTTP-PasswordFields.txt', display_line, value)
+            # Write full HTTP packet to HTTP-Raw.txt
+            write_data('HTTP-Raw.txt', payload_normalized, f'{field_name}={value}')
     
     # Additional regex patterns for enhanced credential detection
     # Access key patterns (access_key_id, access-key-secret, LTAI*)
     for match in REGEX_ACCESS_KEY.finditer(payload_normalized):
-        extract_and_display_match(match, 'access_key', payload_normalized, lines, host, is_http_response)
+        extract_and_display_match(match, 'access_key', payload_normalized, lines, host, is_http_response, http_method, http_path)
     
     # Corp ID/Secret patterns
     for match in REGEX_CORP_CRED.finditer(payload_normalized):
-        extract_and_display_match(match, 'corp_cred', payload_normalized, lines, host, is_http_response)
+        extract_and_display_match(match, 'corp_cred', payload_normalized, lines, host, is_http_response, http_method, http_path)
     
     # JDBC connection strings
     for match in REGEX_JDBC.finditer(payload_normalized):
-        extract_and_display_match(match, 'jdbc', payload_normalized, lines, host, is_http_response)
+        extract_and_display_match(match, 'jdbc', payload_normalized, lines, host, is_http_response, http_method, http_path)
     
     # Basic/Bearer token patterns (excluding Authorization header which is already handled)
     for match in REGEX_AUTH_TOKEN.finditer(payload_normalized):
@@ -558,19 +584,19 @@ def extract_http_password_fields(payload, src, sport, dst, dport, enable_https, 
             line_lower = lines[line_num].lower()
             if 'authorization:' in line_lower:
                 continue
-        extract_and_display_match(match, 'auth_token', payload_normalized, lines, host, is_http_response)
+        extract_and_display_match(match, 'auth_token', payload_normalized, lines, host, is_http_response, http_method, http_path)
     
     # JavaScript password patterns
     for match in REGEX_JS_PASSWORD.finditer(payload_normalized):
-        extract_and_display_match(match, 'js_password', payload_normalized, lines, host, is_http_response)
+        extract_and_display_match(match, 'js_password', payload_normalized, lines, host, is_http_response, http_method, http_path)
     
     # JavaScript key/secret/token patterns
     for match in REGEX_JS_KEY_SECRET.finditer(payload_normalized):
-        extract_and_display_match(match, 'js_key_secret', payload_normalized, lines, host, is_http_response)
+        extract_and_display_match(match, 'js_key_secret', payload_normalized, lines, host, is_http_response, http_method, http_path)
     
     # XML Key tags
     for match in REGEX_XML_KEY.finditer(payload_normalized):
-        extract_and_display_match(match, 'xml_key', payload_normalized, lines, host, is_http_response)
+        extract_and_display_match(match, 'xml_key', payload_normalized, lines, host, is_http_response, http_method, http_path)
 
 def extract_smtp_auth(payload, src, sport, dst, dport):
     """Extract SMTP authentication"""
@@ -995,7 +1021,15 @@ def run():
                     path = os.path.join(root, file)
                     process_pcap(path)
 
+def signal_handler(sig, frame):
+    """Handle Ctrl+C gracefully"""
+    print('\n\nExiting...')
+    sys.exit(0)
+
 if __name__ == '__main__':
+    # Register signal handler for graceful exit on Ctrl+C
+    signal.signal(signal.SIGINT, signal_handler)
+    
     parser = argparse.ArgumentParser(description=VERSION)
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument('-f', dest='fname', help='Pcap file to parse')
@@ -1033,4 +1067,8 @@ if __name__ == '__main__':
     logger.setLevel(logging.WARNING)
     logger.addHandler(logging.FileHandler(session_log, encoding='utf-8'))
 
-    run()
+    try:
+        run()
+    except KeyboardInterrupt:
+        print('\n\nExiting...')
+        sys.exit(0)
