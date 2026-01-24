@@ -442,6 +442,32 @@ def extract_http_password_fields(payload, src, sport, dst, dport, enable_https, 
     # For HTTP responses without Host header, we could use IP:port as fallback
     # But for now, we'll leave it as None to distinguish from requests
     
+    def should_hide_method_path(matched_line, http_method, http_path):
+        """Check if matched_line already contains the HTTP method and path, so we can hide method_path_info"""
+        if not http_method or not http_path or not matched_line:
+            return False
+        
+        matched_line_upper = matched_line.upper().strip()
+        http_method_upper = http_method.upper()
+        
+        # Check if matched_line starts with the HTTP method
+        if not matched_line_upper.startswith(http_method_upper + ' '):
+            return False
+        
+        # Extract path from matched_line (format: "METHOD /path HTTP/1.1" or "METHOD /path?query")
+        # Try to extract path by splitting on space
+        parts = matched_line.split(' ', 2)
+        if len(parts) < 2:
+            return False
+        
+        matched_path = parts[1]
+        # Remove query string and fragment for comparison
+        matched_path_base = matched_path.split('?')[0].split('#')[0]
+        http_path_base = http_path.split('?')[0].split('#')[0]
+        
+        # Compare paths (case-insensitive)
+        return matched_path_base.lower() == http_path_base.lower()
+    
     def extract_and_display_match(match, field_name, payload_normalized, lines, host, is_http_response, http_method=None, http_path=None):
         """Helper function to extract and display a matched credential"""
         value = None
@@ -485,7 +511,8 @@ def extract_http_password_fields(payload, src, sport, dst, dport, enable_https, 
         # Format message with HTTP method and path
         msg_type = 'Response' if is_http_response else 'Request'
         method_path_info = ''
-        if http_method and http_path:
+        # Only show method_path_info if matched_line doesn't already contain it
+        if http_method and http_path and not should_hide_method_path(matched_line, http_method, http_path):
             method_path_info = f'{http_method} {http_path}\n'
         
         if host:
@@ -536,7 +563,12 @@ def extract_http_password_fields(payload, src, sport, dst, dport, enable_https, 
             
             # Format message with HTTP method and path
             method_path_info = ''
-            if http_method and http_path:
+            # Only show method_path_info if matched_line doesn't already contain it
+            if http_method and http_path and matched_line:
+                if not should_hide_method_path(matched_line, http_method, http_path):
+                    method_path_info = f'{http_method} {http_path}\n'
+            elif http_method and http_path:
+                # If matched_line is empty, always show method_path_info
                 method_path_info = f'{http_method} {http_path}\n'
             
             if matched_line:
