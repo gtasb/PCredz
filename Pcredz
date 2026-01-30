@@ -77,6 +77,7 @@ logged_messages = set()
 detected_offset = None
 disabled_protocols = set()  # Protocols to skip
 excluded_hosts = set()  # IPs to exclude from capture
+http_flows = {}  # Store HTTP requests/responses for pairing: {(src, sport, dst, dport): {'request': payload, 'response': payload}}
 
 # Pre-compiled regex patterns
 REGEX_HTTP_BASIC = re.compile(rb'Authorization: Basic ([A-Za-z0-9+/=]+)', re.IGNORECASE)
@@ -135,6 +136,16 @@ REGEX_XML_KEY = re.compile(
     re.IGNORECASE | re.DOTALL
 )
 
+# Cookie patterns (for Cookie and Set-Cookie headers)
+REGEX_COOKIE = re.compile(
+    r'(?:Cookie|Set-Cookie):\s*([^=]+(?:password|pass|_password|passwd|session_password|sessionpassword|'
+    r'login_password|loginpassword|form_pw|pw|userpassword|pwd|upassword|'
+    r'passwort|passwrd|wppassword|j_password|admin_password|admin_pass|'
+    r'secret|api_key|token|key|auth|session|sessionid|sid|jsessionid|'
+    r'csrf|xsrf|authenticity_token|access_token|refresh_token)[^=]*?)\s*=\s*([^;,\s]+)',
+    re.IGNORECASE | re.MULTILINE
+)
+
 def write_data(outfile, data, key):
     """Write credentials to file with deduplication"""
     outfile_path = os.path.join(output_path, "logs", outfile)
@@ -147,6 +158,37 @@ def write_data(outfile, data, key):
     seen_credentials.add(cache_key)
     with open(outfile_path, 'a', encoding='utf-8') as f:
         f.write(data + '\n')
+
+def write_http_raw_with_pair(outfile, current_payload, key, flow_key, is_http_response):
+    """Write HTTP packet to file with paired request/response"""
+    outfile_path = os.path.join(output_path, "logs", outfile)
+    os.makedirs(os.path.dirname(outfile_path), exist_ok=True)
+    
+    cache_key = (outfile, key)
+    if cache_key in seen_credentials:
+        return
+    
+    seen_credentials.add(cache_key)
+    
+    # Get paired request/response
+    # When writing a response, include the paired request if available
+    # When writing a request, include the paired response if available
+    paired_data = ""
+    if flow_key in http_flows:
+        flow_data = http_flows[flow_key]
+        if is_http_response and 'request' in flow_data:
+            # Writing response, include request
+            paired_data = "=== REQUEST ===\n" + flow_data['request'] + "\n\n"
+        elif not is_http_response and 'response' in flow_data:
+            # Writing request, include response
+            paired_data = "=== RESPONSE ===\n" + flow_data['response'] + "\n\n"
+    
+    # Write current packet with paired data
+    current_type = 'RESPONSE' if is_http_response else 'REQUEST'
+    full_data = paired_data + f"=== {current_type} ===\n" + current_payload
+    
+    with open(outfile_path, 'a', encoding='utf-8') as f:
+        f.write(full_data + '\n\n')
 
 def get_packet_info(src, sport, dst, dport):
     """Generate packet info string with optional timestamp and colors"""
@@ -379,7 +421,7 @@ def extract_http_basic(payload, src, sport, dst, dport):
         except (base64.binascii.Error, UnicodeDecodeError):
             pass
 
-def extract_http_password_fields(payload, src, sport, dst, dport, enable_https, enable_http_response=False):
+def extract_http_password_fields(payload, src, sport, dst, dport, enable_https, enable_http_response=False, enable_cookie=False):
     """Extract password-like fields from HTTP requests and optionally responses"""
     if is_protocol_disabled('HTTP'):
         return
@@ -413,6 +455,17 @@ def extract_http_password_fields(payload, src, sport, dst, dport, enable_https, 
         return
     if is_http_response and not enable_http_response:
         return
+    
+    # Get flow key for request/response pairing
+    flow_key = get_flow_key(src, sport, dst, dport)
+    
+    # Store request/response for pairing
+    if flow_key not in http_flows:
+        http_flows[flow_key] = {}
+    if is_http_request:
+        http_flows[flow_key]['request'] = payload_normalized
+    else:
+        http_flows[flow_key]['response'] = payload_normalized
     
     # Extract HTTP method and path from request line
     http_method = None
@@ -468,7 +521,7 @@ def extract_http_password_fields(payload, src, sport, dst, dport, enable_https, 
         # Compare paths (case-insensitive)
         return matched_path_base.lower() == http_path_base.lower()
     
-    def extract_and_display_match(match, field_name, payload_normalized, lines, host, is_http_response, http_method=None, http_path=None):
+    def extract_and_display_match(match, field_name, payload_normalized, lines, host, is_http_response, http_method=None, http_path=None, flow_key=None):
         """Helper function to extract and display a matched credential"""
         value = None
         match_text = None
@@ -523,8 +576,8 @@ def extract_http_password_fields(payload, src, sport, dst, dport, enable_https, 
         # Log and display
         print_and_log(src, sport, dst, dport, msg, credential_key=f'HTTP-Field:{field_name}={value}')
         write_data('HTTP-PasswordFields.txt', matched_line, value)
-        # Write full HTTP packet to HTTP-Raw.txt
-        write_data('HTTP-Raw.txt', payload_normalized, f'{field_name}={value}')
+        # Write full HTTP packet to HTTP-Raw.txt with paired request/response
+        write_http_raw_with_pair('HTTP-Raw.txt', payload_normalized, f'{field_name}={value}', flow_key, is_http_response)
     
     # Use normalized payload for regex matching to ensure consistency
     # This will match password fields in URL query strings, POST body, and HTTP headers (Cookie, Authorization, etc.)
@@ -591,21 +644,53 @@ def extract_http_password_fields(payload, src, sport, dst, dport, enable_https, 
             
             print_and_log(src, sport, dst, dport, msg, credential_key=f'HTTP-Field:{field_name}={value}')
             write_data('HTTP-PasswordFields.txt', display_line, value)
-            # Write full HTTP packet to HTTP-Raw.txt
-            write_data('HTTP-Raw.txt', payload_normalized, f'{field_name}={value}')
+            # Write full HTTP packet to HTTP-Raw.txt with paired request/response
+            write_http_raw_with_pair('HTTP-Raw.txt', payload_normalized, f'{field_name}={value}', flow_key, is_http_response)
+    
+    # Cookie extraction (if enabled)
+    if enable_cookie:
+        for match in REGEX_COOKIE.finditer(payload_normalized):
+            cookie_name = match.group(1).strip()
+            cookie_value = match.group(2).strip()
+            if len(cookie_value) > 3 and cookie_value.isprintable() and not cookie_value.isspace():
+                # Extract the line containing the match
+                match_start = match.start()
+                line_num = payload_normalized[:match_start].count('\n')
+                
+                if line_num < len(lines):
+                    matched_line = lines[line_num].strip()
+                    matched_line = matched_line.replace('\n', ' ').replace('\r', ' ').replace('\t', ' ')
+                    matched_line = re.sub(r' +', ' ', matched_line).strip()
+                else:
+                    matched_line = match.group(0)
+                
+                # Format message
+                msg_type = 'Response' if is_http_response else 'Request'
+                method_path_info = ''
+                if http_method and http_path and not should_hide_method_path(matched_line, http_method, http_path):
+                    method_path_info = f'{http_method} {http_path}\n'
+                
+                if host:
+                    msg = f'{method_path_info}Host: {host}\nPotential password submission:\n{msg_type}: {matched_line}'
+                else:
+                    msg = f'{method_path_info}Potential password submission:\n{msg_type}: {matched_line}'
+                
+                print_and_log(src, sport, dst, dport, msg, credential_key=f'HTTP-Cookie:{cookie_name}={cookie_value}')
+                write_data('HTTP-PasswordFields.txt', matched_line, cookie_value)
+                write_http_raw_with_pair('HTTP-Raw.txt', payload_normalized, f'Cookie:{cookie_name}={cookie_value}', flow_key, is_http_response)
     
     # Additional regex patterns for enhanced credential detection
     # Access key patterns (access_key_id, access-key-secret, LTAI*)
     for match in REGEX_ACCESS_KEY.finditer(payload_normalized):
-        extract_and_display_match(match, 'access_key', payload_normalized, lines, host, is_http_response, http_method, http_path)
+        extract_and_display_match(match, 'access_key', payload_normalized, lines, host, is_http_response, http_method, http_path, flow_key)
     
     # Corp ID/Secret patterns
     for match in REGEX_CORP_CRED.finditer(payload_normalized):
-        extract_and_display_match(match, 'corp_cred', payload_normalized, lines, host, is_http_response, http_method, http_path)
+        extract_and_display_match(match, 'corp_cred', payload_normalized, lines, host, is_http_response, http_method, http_path, flow_key)
     
     # JDBC connection strings
     for match in REGEX_JDBC.finditer(payload_normalized):
-        extract_and_display_match(match, 'jdbc', payload_normalized, lines, host, is_http_response, http_method, http_path)
+        extract_and_display_match(match, 'jdbc', payload_normalized, lines, host, is_http_response, http_method, http_path, flow_key)
     
     # Basic/Bearer token patterns (excluding Authorization header which is already handled)
     for match in REGEX_AUTH_TOKEN.finditer(payload_normalized):
@@ -616,19 +701,19 @@ def extract_http_password_fields(payload, src, sport, dst, dport, enable_https, 
             line_lower = lines[line_num].lower()
             if 'authorization:' in line_lower:
                 continue
-        extract_and_display_match(match, 'auth_token', payload_normalized, lines, host, is_http_response, http_method, http_path)
+        extract_and_display_match(match, 'auth_token', payload_normalized, lines, host, is_http_response, http_method, http_path, flow_key)
     
     # JavaScript password patterns
     for match in REGEX_JS_PASSWORD.finditer(payload_normalized):
-        extract_and_display_match(match, 'js_password', payload_normalized, lines, host, is_http_response, http_method, http_path)
+        extract_and_display_match(match, 'js_password', payload_normalized, lines, host, is_http_response, http_method, http_path, flow_key)
     
     # JavaScript key/secret/token patterns
     for match in REGEX_JS_KEY_SECRET.finditer(payload_normalized):
-        extract_and_display_match(match, 'js_key_secret', payload_normalized, lines, host, is_http_response, http_method, http_path)
+        extract_and_display_match(match, 'js_key_secret', payload_normalized, lines, host, is_http_response, http_method, http_path, flow_key)
     
     # XML Key tags
     for match in REGEX_XML_KEY.finditer(payload_normalized):
-        extract_and_display_match(match, 'xml_key', payload_normalized, lines, host, is_http_response, http_method, http_path)
+        extract_and_display_match(match, 'xml_key', payload_normalized, lines, host, is_http_response, http_method, http_path, flow_key)
 
 def extract_smtp_auth(payload, src, sport, dst, dport):
     """Extract SMTP authentication"""
@@ -985,7 +1070,7 @@ def process_packet(packet):
         extract_ntlm(search_payload, src, sport, dst, dport)
         extract_ntlm_from_http(payload, src, sport, dst, dport)
         extract_http_basic(payload, src, sport, dst, dport)
-        extract_http_password_fields(payload, src, sport, dst, dport, args.enable_https, args.enable_http_response)
+        extract_http_password_fields(payload, src, sport, dst, dport, args.enable_https, args.enable_http_response, args.enable_cookie)
         extract_smtp_auth(payload, src, sport, dst, dport)
         extract_ldap_simple_bind(payload, src, sport, dst, dport)
         
@@ -999,7 +1084,7 @@ def process_packet(packet):
 
 def process_pcap(fname):
     """Process a PCAP/PCAPNG file"""
-    global detected_offset, ntlm_challenge, ftp_users, seen_credentials, logged_messages
+    global detected_offset, ntlm_challenge, ftp_users, seen_credentials, logged_messages, http_flows
     
     # Reset state for new file
     detected_offset = None
@@ -1007,6 +1092,7 @@ def process_pcap(fname):
     ftp_users.clear()
     seen_credentials.clear()
     logged_messages.clear()
+    http_flows.clear()
     
     start_time = time.time()
     file_size = os.path.getsize(fname) / (1024 * 1024)
@@ -1077,6 +1163,7 @@ if __name__ == '__main__':
                         help='Exclude host IP from capture (can be used multiple times)')
     parser.add_argument('--enable-https', action='store_true', dest='enable_https', default=False, help='Enable HTTPS decryption')
     parser.add_argument('--enable-http-response', action='store_true', dest='enable_http_response', default=False, help='Enable HTTP response scan')
+    parser.add_argument('--enable-cookie', action='store_true', dest='enable_cookie', default=False, help='Enable Cookie extraction')
     args = parser.parse_args()
     
     # Process disabled protocols
